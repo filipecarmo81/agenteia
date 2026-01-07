@@ -1,137 +1,172 @@
 import os
-from datetime import datetime, timedelta, timezone
-
-import feedparser
+import sys
+import textwrap
 import requests
-from dateutil import parser as dateparser
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+
 from openai import OpenAI
 
-OPENAI_RSS = "https://openai.com/blog/rss.xml"
-OPENAI_NEWS_FALLBACK = "https://openai.com/news"
-DAYS_LOOKBACK = 7
-MAX_ITEMS = 5
 
-def must_env(name: str) -> str:
-    v = os.getenv(name, "").strip()
-    if not v:
-        raise RuntimeError(f"Missing env var: {name}")
-    return v
+RSS_URL_DEFAULT = "https://openai.com/blog/rss.xml"
 
-def parse_date_safe(s: str):
-    try:
-        return dateparser.parse(s)
-    except Exception:
-        return None
 
-def now_utc():
-    return datetime.now(timezone.utc)
+def _get_text(elem, tag):
+    child = elem.find(tag)
+    if child is None or child.text is None:
+        return ""
+    return child.text.strip()
 
-def within_lookback(dt: datetime, days: int) -> bool:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt >= (now_utc() - timedelta(days=days))
 
-def telegram_send(token: str, chat_id: str, text: str):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+def fetch_rss_items(rss_url: str, limit: int = 10):
+    """
+    Parseia RSS (XML) com biblioteca padrão.
+    Retorna lista de itens com: title, link, published_dt, description.
+    """
+    r = requests.get(rss_url, timeout=30, headers={"User-Agent": "RadarIA/1.0"})
+    r.raise_for_status()
+
+    root = ET.fromstring(r.text)
+
+    # RSS 2.0 típico: <rss><channel><item>...
+    channel = root.find("channel")
+    if channel is None:
+        # Alguns feeds usam namespaces; tentar achar channel na marra
+        channel = root.find(".//channel")
+    if channel is None:
+        return []
+
+    items = []
+    for item in channel.findall("item"):
+        title = _get_text(item, "title")
+        link = _get_text(item, "link")
+        desc = _get_text(item, "description")
+        pub = _get_text(item, "pubDate")
+
+        published_dt = None
+        if pub:
+            try:
+                published_dt = parsedate_to_datetime(pub)
+            except Exception:
+                published_dt = None
+
+        if title and link:
+            items.append(
+                {
+                    "title": title,
+                    "link": link,
+                    "published_dt": published_dt,
+                    "description": desc,
+                    "pub_raw": pub,
+                }
+            )
+
+    # Ordena por data (mais recente primeiro). Itens sem data vão pro fim.
+    items.sort(key=lambda x: (x["published_dt"] is None, x["published_dt"]), reverse=True)
+    return items[:limit]
+
+
+def build_prompt(items, topic_name: str):
+    """
+    Monta prompt para resumir 5 itens, PT-BR, 4–6 linhas, factual.
+    """
+    bullets = []
+    for i, it in enumerate(items, start=1):
+        dt = it["published_dt"].isoformat() if it["published_dt"] else (it["pub_raw"] or "sem data")
+        bullets.append(
+            f"{i}. Título: {it['title']}\n"
+            f"   Data: {dt}\n"
+            f"   Link: {it['link']}\n"
+            f"   Trecho/descrição: {it['description'][:300]}"
+        )
+
+    joined = "\n\n".join(bullets)
+
+    return f"""
+Você é um curador de notícias de IA. Gere uma mensagem ÚNICA em português (PT-BR), objetiva, factual (sem opinião), com 5 notícias do tópico: "{topic_name}".
+
+Regras:
+- Cada notícia deve ter: título em negrito, 4–6 linhas de resumo (misto: o que aconteceu + por que importa), e o link.
+- Ranqueie implicitamente considerando: Relevância, Data mais recente, Novidade, Impacto.
+- Evite paywall. Se parecer paywall, apenas cite o título + link e explique em 1 linha que é paywall.
+- Não invente fatos; use apenas o que está nos títulos/descrições fornecidos.
+
+Itens coletados (RSS):
+{joined}
+""".strip()
+
+
+def send_telegram_message(bot_token: str, chat_id: str, text: str):
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
+        "parse_mode": "Markdown",
         "disable_web_page_preview": True,
-        "parse_mode": "HTML",
     }
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
+    return r.json()
 
-def pick_candidates_from_rss():
-    feed = feedparser.parse(OPENAI_RSS)
-    entries = feed.entries or []
-
-    candidates = []
-    for e in entries:
-        title = (e.get("title") or "").strip()
-        link = (e.get("link") or "").strip()
-
-        published = e.get("published") or e.get("updated") or ""
-        dt = parse_date_safe(published) if published else None
-
-        if not title or not link or not dt:
-            continue
-        if not within_lookback(dt, DAYS_LOOKBACK):
-            continue
-
-        summary = (e.get("summary") or "").strip()
-        candidates.append({
-            "title": title,
-            "link": link,
-            "dt": dt,
-            "summary": summary[:1200],  # keep cost low
-        })
-
-    candidates.sort(key=lambda x: x["dt"], reverse=True)
-    return candidates[:max(MAX_ITEMS, 1)]
 
 def main():
-    # Secrets via env vars (GitHub Actions)
-    tg_token = must_env("TELEGRAM_BOT_TOKEN")
-    tg_chat_id = must_env("TELEGRAM_CHAT_ID")
-    openai_key = must_env("OPENAI_API_KEY")
+    # Secrets/Vars esperados
+    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
 
-    # 1) Collect candidates (RSS primary)
-    candidates = pick_candidates_from_rss()
+    # Config
+    rss_url = os.environ.get("RSS_URL", RSS_URL_DEFAULT).strip()
+    topic_name = os.environ.get("TOPIC_NAME", "Modelos de Linguagem & Foundation Models").strip()
 
-    # 2) If nothing recent, notify and exit (fallback is optional and can be added later)
-    if not candidates:
-        telegram_send(
-            tg_token,
-            tg_chat_id,
-            "📡 <b>Radar IA (OpenAI)</b>\n\nNenhuma novidade relevante nos últimos 7 dias."
+    # MODELO: deixe configurável para evitar 403
+    # Ex.: gpt-4o-mini, gpt-4o, ou outro que seu projeto tenha acesso
+    openai_model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+    if not telegram_token or not telegram_chat_id:
+        print("ERRO: TELEGRAM_BOT_TOKEN e/ou TELEGRAM_CHAT_ID não configurados.", file=sys.stderr)
+        sys.exit(1)
+
+    if not openai_key:
+        print("ERRO: OPENAI_API_KEY não configurada.", file=sys.stderr)
+        sys.exit(1)
+
+    items = fetch_rss_items(rss_url, limit=10)
+    if not items:
+        send_telegram_message(
+            telegram_token,
+            telegram_chat_id,
+            f"Radar IA: não consegui ler o RSS agora.\nFonte: {rss_url}",
         )
         return
 
-    # 3) Build prompt and summarize via OpenAI API (low cost)
-    items_block = "\n\n".join(
-        f"- Título: {c['title']}\n  Link: {c['link']}\n  Contexto (RSS): {c['summary']}"
-        for c in candidates
-    )
-
-    system = (
-        "Você é um editor técnico-executivo. Resuma notícias com objetividade, apenas fatos. "
-        "Sem opinião. Em português. 4 a 6 linhas por notícia."
-    )
-
-    user = f"""Gere um boletim único com {len(candidates)} itens.
-
-Regras:
-- Cada item: TÍTULO em uma linha, depois 4–6 linhas de resumo.
-- Incluir o link ao final do item.
-- Não inventar detalhes: use apenas o contexto fornecido.
-- Linguagem: PT-BR, factual.
-
-Itens:
-{items_block}
-""".strip()
+    top5 = items[:5]
+    prompt = build_prompt(top5, topic_name)
 
     client = OpenAI(api_key=openai_key)
 
-    resp = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        max_output_tokens=800,
-    )
+    try:
+        resp = client.responses.create(
+            model=openai_model,
+            input=prompt,
+        )
+        # SDK atual retorna texto agregado em output_text
+        text = (resp.output_text or "").strip()
+        if not text:
+            raise RuntimeError("Resposta vazia do modelo.")
+    except Exception as e:
+        # Fallback: manda só títulos+links para não ficar sem entrega
+        lines = [f"Radar IA (fallback) — não consegui resumir via OpenAI.\nMotivo: {type(e).__name__}\n"]
+        for it in top5:
+            lines.append(f"- {it['title']}\n  {it['link']}")
+        text = "\n".join(lines)
 
-    text = resp.output_text.strip()
+    # Telegram tem limite ~4096 chars por msg. Se passar, corta.
+    if len(text) > 3800:
+        text = textwrap.shorten(text, width=3800, placeholder="\n\n(...)")
 
-    header = f"📡 <b>Radar IA — OpenAI</b>\n🗓️ {datetime.now().strftime('%d/%m/%Y')}\n"
-    final = header + "\n" + text
+    send_telegram_message(telegram_token, telegram_chat_id, text)
 
-    # Telegram message limit is ~4096 chars; keep margin
-    if len(final) > 3800:
-        final = final[:3800] + "\n\n(boletim truncado por limite do Telegram)"
-
-    telegram_send(tg_token, tg_chat_id, final)
 
 if __name__ == "__main__":
     main()
